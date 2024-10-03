@@ -1,52 +1,16 @@
-FROM mcr.microsoft.com/dotnet/runtime-deps:6.0-focal
-
-LABEL org.opencontainers.image.source="https://github.com/actions-runner-controller/runner-images"
+# Source: https://github.com/dotnet/dotnet-docker
+FROM mcr.microsoft.com/dotnet/runtime-deps:6.0-jammy as build
 
 ARG TARGETOS
 ARG TARGETARCH
-ARG RUNNER_VERSION=2.310.2
-ARG RUNNER_CONTAINER_HOOKS_VERSION=0.3.2
-ARG DOCKER_VERSION=23.0.6
+ARG RUNNER_VERSION
+ARG RUNNER_CONTAINER_HOOKS_VERSION=0.6.1
+ARG DOCKER_VERSION=27.1.1
+ARG BUILDX_VERSION=0.16.2
 
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update -y \
-    && apt-get install -y --no-install-recommends \
-        sudo \
-        # packages in actions-runner-controller/runner-22.04
-        curl \
-        git \
-        jq \
-        unzip \
-        zip \
-        # packages in actions-runner-controller/runner-20.04
-        build-essential \
-        locales \
-        tzdata \
-        # ruby/setup-ruby dependencies
-        # https://github.com/ruby/setup-ruby#using-self-hosted-runners
-        libyaml-dev \
-        # dockerd dependencies
-        tini \
-        iptables
+RUN apt update -y && apt install curl unzip -y
 
-# KEEP LESS PACKAGES:
-# We'd like to keep this image small for maintanability and security.
-# See also,
-# https://github.com/actions/actions-runner-controller/pull/2050
-# https://github.com/actions/actions-runner-controller/blob/master/runner/actions-runner.ubuntu-22.04.dockerfile
-
-# keep /var/lib/apt/lists to reduce time of apt-get update in a job
-
-# set up the runner environment,
-# based on https://github.com/actions/runner/blob/v2.309.0/images/Dockerfile
-RUN adduser --disabled-password --gecos "" --uid 1001 runner \
-    && groupadd docker --gid 123 \
-    && usermod -aG sudo runner \
-    && usermod -aG docker runner \
-    && echo "%sudo   ALL=(ALL:ALL) NOPASSWD:ALL" > /etc/sudoers \
-    && echo "Defaults env_keep += \"DEBIAN_FRONTEND\"" >> /etc/sudoers
-
-WORKDIR /home/runner
+WORKDIR /actions-runner
 RUN export RUNNER_ARCH=${TARGETARCH} \
     && if [ "$RUNNER_ARCH" = "amd64" ]; then export RUNNER_ARCH=x64 ; fi \
     && curl -f -L -o runner.tar.gz https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-${TARGETOS}-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz \
@@ -63,100 +27,42 @@ RUN export RUNNER_ARCH=${TARGETARCH} \
     && curl -fLo docker.tgz https://download.docker.com/${TARGETOS}/static/stable/${DOCKER_ARCH}/docker-${DOCKER_VERSION}.tgz \
     && tar zxvf docker.tgz \
     && rm -rf docker.tgz \
-    && install -o root -g root -m 755 docker/* /usr/bin/ \
-    && rm -rf docker
+    && mkdir -p /usr/local/lib/docker/cli-plugins \
+    && curl -fLo /usr/local/lib/docker/cli-plugins/docker-buildx \
+        "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-${TARGETARCH}" \
+    && chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
 
-# some setup actions store cache into /opt/hostedtoolcache
-ENV RUNNER_TOOL_CACHE /opt/hostedtoolcache
+FROM mcr.microsoft.com/dotnet/runtime-deps:6.0-jammy
 
-RUN mkdir /opt/hostedtoolcache \
-    && chown runner:docker /opt/hostedtoolcache
+ENV DEBIAN_FRONTEND=noninteractive
+ENV RUNNER_MANUALLY_TRAP_SIG=1
+ENV ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=1
+ENV ImageOS=ubuntu22
 
-# We pre-install nodejs to reduce time of setup-node and improve its reliability.
-ENV NODE_VERSION 18.18.2
+# 'gpg-agent' and 'software-properties-common' are needed for the 'add-apt-repository' command that follows
+RUN apt update -y \
+    && apt install -y --no-install-recommends sudo lsb-release gpg-agent software-properties-common curl jq unzip \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN if [ "${TARGETARCH}" = "amd64" ]; then export NODE_ARCH=x64 ; else export NODE_ARCH=${TARGETARCH} ; fi; \
-    mkdir -p /opt/hostedtoolcache/node/${NODE_VERSION}/${NODE_ARCH} && \
-    curl -s -L https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.gz \
-    | tar xvzf - --strip-components=1 -C /opt/hostedtoolcache/node/${NODE_VERSION}/${NODE_ARCH} \
-    && touch /opt/hostedtoolcache/node/${NODE_VERSION}/${NODE_ARCH}.complete \
-    && chown -R runner:docker /opt/hostedtoolcache/node && \
-    ${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/${NODE_ARCH}/bin/node --version
+# Configure git-core/ppa based on guidance here:  https://git-scm.com/download/linux
+RUN add-apt-repository ppa:git-core/ppa \
+    && apt update -y \
+    && apt install -y --no-install-recommends git
 
-RUN export PATH=$PATH:/home/runner/externals/node20/bin ; export NODE_PATH=/home/runner/externals/node20/lib/node_modules ; \
-    npm install -g @actions/tool-cache && node <<EOF && npm uninstall -g @actions/tool-cache
-const tc = require('@actions/tool-cache');
-const allNodeVersions = tc.findAllVersions('node');
-const expected = ['${NODE_VERSION}'];
-if (expected[0] == '') {
-  console.log('Invalid NODE_VERSION: ' + expected[0]);
-  process.on("exit", function() {
-      process.exit(1);
-  });
-} else if (allNodeVersions.length != expected.length) {
-  console.log('Expected versions of node available: ' + expected);
-  console.log('Actual versions of node available: ' + allNodeVersions);
-  process.on("exit", function() {
-    process.exit(1);
-  });
-} else if (allNodeVersions[0] != expected[0]) {
-  console.log('Expected versions of node available: ' + expected);
-  console.log('Actual versions of node available: ' + allNodeVersions);
-  process.on("exit", function() {
-    process.exit(1);
-  });
-} else {
-  console.log('Versions of node available: ' + allNodeVersions);
-}
-EOF
+RUN adduser --disabled-password --gecos "" --uid 1001 runner \
+    && groupadd docker --gid 123 \
+    && usermod -aG sudo runner \
+    && usermod -aG docker runner \
+    && echo "%sudo   ALL=(ALL:ALL) NOPASSWD:ALL" > /etc/sudoers \
+    && echo "Defaults env_keep += \"DEBIAN_FRONTEND\"" >> /etc/sudoers
 
-ENV RUBY_VERSION 3.2.2
-RUN if [ "${TARGETARCH}" = "amd64" ]; then export RUBY_ARCH=x64 ; else export RUBY_ARCH=${TARGETARCH} ; fi; \
-    git clone https://github.com/rbenv/ruby-build.git && \
-    ./ruby-build/install.sh && \
-    apt-get install -y --no-install-recommends zlib1g-dev libssl-dev && \
-    RUBY_CONFIGURE_OPTS="--enable-shared --disable-install-doc" ruby-build --verbose ${RUBY_VERSION} ${RUNNER_TOOL_CACHE}/Ruby/${RUBY_VERSION}/${RUBY_ARCH} && \
-    ${RUNNER_TOOL_CACHE}/Ruby/${RUBY_VERSION}/${RUBY_ARCH}/bin/ruby --version
+WORKDIR /home/runner
 
-RUN if [ "${TARGETARCH}" = "amd64" ]; then export RUBY_ARCH=x64 ; else export RUBY_ARCH=${TARGETARCH} ; fi; \
-    touch ${RUNNER_TOOL_CACHE}/Ruby/${RUBY_VERSION}/${RUBY_ARCH}.complete && \
-    chown -R runner:docker /opt/hostedtoolcache/Ruby
+COPY --chown=runner:docker --from=build /actions-runner .
+COPY --from=build /usr/local/lib/docker/cli-plugins/docker-buildx /usr/local/lib/docker/cli-plugins/docker-buildx
 
-RUN export PATH=$PATH:/home/runner/externals/node20/bin ; export NODE_PATH=/home/runner/externals/node20/lib/node_modules ; \
-    ls -lah ${RUNNER_TOOL_CACHE}/Ruby/${RUBY_VERSION} && npm install -g @actions/tool-cache && node <<EOF && npm uninstall -g @actions/tool-cache
-const tc = require('@actions/tool-cache');
-const allRubyVersions = tc.findAllVersions('Ruby');
-const expected = ['${RUBY_VERSION}'];
-if (expected[0] == '') {
-  console.log('Invalid RUBY_VERSION: ' + expected[0]);
-  process.on("exit", function() {
-      process.exit(1);
-  });
-} else if (allRubyVersions.length != expected.length) {
-  console.log('Expected versions of ruby available: ' + expected);
-  console.log('Actual versions of ruby available: ' + allRubyVersions);
-  process.on("exit", function() {
-    process.exit(1);
-  });
-} else if (allRubyVersions[0] != expected[0]) {
-  console.log('Expected versions of ruby available: ' + expected);
-  console.log('Actual versions of ruby available: ' + allRubyVersions);
-  process.on("exit", function() {
-    process.exit(1);
-  });
-} else {
-  console.log('Versions of ruby available: ' + allRubyVersions);
-}
-EOF
+RUN install -o root -g root -m 755 docker/* /usr/bin/ && rm -rf docker
 
-COPY entrypoint.sh /
-
-VOLUME /var/lib/docker
-
-# some setup actions depend on ImageOS variable
-# https://github.com/actions/runner-images/issues/345
-ENV ImageOS=ubuntu20
+RUN
 
 USER runner
-ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
-CMD ["/home/runner/run.sh"]
