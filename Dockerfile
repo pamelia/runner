@@ -41,7 +41,7 @@ ENV ImageOS=ubuntu22
 
 # 'gpg-agent' and 'software-properties-common' are needed for the 'add-apt-repository' command that follows
 RUN apt update -y \
-    && apt install -y --no-install-recommends sudo lsb-release gpg-agent software-properties-common curl jq unzip helm \
+    && apt install -y --no-install-recommends apt-transport-https sudo lsb-release gpg-agent software-properties-common curl jq unzip gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure git-core/ppa based on guidance here:  https://git-scm.com/download/linux
@@ -52,6 +52,11 @@ RUN add-apt-repository ppa:git-core/ppa \
 RUN add-apt-repository ppa:rmescandon/yq \
     && apt update -y \
     && apt install -y yq
+
+RUN curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | tee /usr/share/keyrings/helm.gpg > /dev/null \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" |  tee /etc/apt/sources.list.d/helm-stable-debian.list \
+    && apt-get update -y \
+    && apt-get install -y helm
 
 RUN adduser --disabled-password --gecos "" --uid 1001 runner \
     && groupadd docker --gid 123 \
